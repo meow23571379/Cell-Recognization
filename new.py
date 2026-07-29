@@ -33,7 +33,7 @@ def convert_lif_to_tif():
             tif_file_name = os.path.splitext(filename)[0] + ".tif"
             output_tif_path = os.path.join(os.path.dirname(filepath), tif_file_name)
             
-            tiff.imwrite(output_tif_path, matrix_data)
+            tiff.imwrite(output_tif_path, matrix_data, imagej=True, metadata={'axes': 'CYX'})
         except Exception as e:
             print(f"Error converting {filename}: {e}")
             
@@ -58,10 +58,10 @@ def process_images():
             
             ch1, ch2, ch3 = raw_data[0], raw_data[1], raw_data[2]
 
-            smoothed_data1 = gaussian(ch1, sigma=30.0)
-            smoothed_data2 = gaussian(ch2, sigma=30.0)
-            data = (smoothed_data1 + smoothed_data2) / 2
-            smoothed_data = gaussian(data, sigma=30.0)
+            smoothed_data1 = gaussian(ch1, sigma=20.0)
+            smoothed_data2 = gaussian(ch2, sigma=20.0)
+            data = (smoothed_data1 + smoothed_data2*2) / 3
+            smoothed_data = gaussian(data, sigma=20.0)
 
             threshold = np.mean(smoothed_data) * 0.5
             mask = smoothed_data > threshold
