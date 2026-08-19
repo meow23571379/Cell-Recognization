@@ -11,9 +11,166 @@ from skimage.feature import peak_local_max
 from skimage.segmentation import watershed
 from skimage.filters import gaussian, threshold_otsu
 from skimage.exposure import equalize_adapthist
+from skimage.measure import label as sk_label, regionprops
+from skimage.morphology import remove_small_objects
 import pandas as pd
 import re
 from readlif.reader import LifFile
+
+
+# ---------------------------------------------------------------------------
+# Nucleus channel handling
+# ---------------------------------------------------------------------------
+# The nucleus (DAPI/Hoechst) is not always acquired in the same channel: in
+# some .lif files it is channel 1, in others channel 2. All downstream code
+# assumes the nucleus is channel 2 (index 1). To avoid mixing that up, we
+# DETECT the nucleus channel at conversion time and REORDER the channels so
+# the nucleus is always written to channel 2. The two non-nucleus channels
+# keep their original relative order, so colocalization (M1/M2 between ch1 and
+# ch3) stays consistent.
+#
+# Detection uses two strategies, in order:
+#   1. LIF metadata (PRIMARY): each channel carries a Leica "LUTName". The
+#      nuclear stain is imaged with the blue LUT, so the channel whose LUT is
+#      "Blue" is the nucleus. This was verified to be correct on real data,
+#      where the morphology heuristic alone was NOT reliable (a channel with a
+#      few solid bright cells outscored the dim, textured, real nuclei).
+#   2. Morphology (FALLBACK): if no LUT info is available (e.g. re-processing
+#      an already-converted TIF, or a non-Leica file), fall back to scoring
+#      each channel by how nucleus-like its blobs are.
+#
+# --- Config you can tweak ---
+# Force a specific 0-based channel as the nucleus (skips all auto-detection).
+# None = auto-detect.
+MANUAL_NUCLEUS_CHANNEL = None
+
+# Use the LIF LUT metadata as the primary detector. Set False to rely purely
+# on morphology (not recommended for these files).
+USE_LUT_METADATA = True
+
+# The LUT name Leica assigns to the nuclear channel (case-insensitive).
+NUCLEUS_LUT_NAME = "Blue"
+
+# Final index the nucleus should occupy in every exported TIF (0-based).
+# 1 == "channel 2", which is what process_images() expects.
+NUCLEUS_TARGET_INDEX = 1
+
+
+def series_channel_luts(lif_file):
+    """Return a list (aligned with LifFile.get_iter_image()) where each entry
+    is that series' channel LUT names ordered by real channel index.
+
+    Leica stores per-channel LUTName ("Blue"/"Red"/"Green"/"Gray"...) in the
+    image XML. Channel order is given by the BytesInc attribute, so we sort by
+    it rather than trusting document order of the ChannelDescription elements.
+    Returns [] if the structure can't be read, so callers fall back cleanly.
+    """
+    try:
+        root = lif_file.xml_root
+    except Exception:
+        return []
+    out = []
+    for el in root.iter("Element"):
+        img = el.find("./Data/Image")
+        if img is None:
+            continue
+        cds = img.findall("./ImageDescription/Channels/ChannelDescription")
+        if not cds:
+            continue
+        ordered = sorted(cds, key=lambda c: int(c.attrib.get("BytesInc", "0") or 0))
+        out.append([c.attrib.get("LUTName", "") for c in ordered])
+    return out
+
+
+def nucleus_index_from_lut(luts, nucleus_lut=NUCLEUS_LUT_NAME):
+    """Return the 0-based index of the nuclear channel from a list of LUT
+    names, or None if the target LUT isn't present."""
+    if not luts:
+        return None
+    lut_lower = [str(x).lower() for x in luts]
+    target = str(nucleus_lut).lower()
+    if target in lut_lower:
+        return lut_lower.index(target)
+    return None
+
+
+def nucleus_likeness(channel):
+    """Score how 'nucleus-like' a single 2D channel is (higher = more likely
+    to be the DAPI/Hoechst nuclear channel).
+
+    A nuclear stain forms a moderate number of SOLID, ROUND, similarly-sized
+    blobs (one per cell). Colocalization markers are instead punctate (many
+    tiny specks) or diffuse/textured (irregular, low solidity). We threshold,
+    fill holes, drop noise, then reward high area-weighted solidity + extent,
+    roundness, a plausible nucleus size scale, and size uniformity. All size
+    thresholds are fractions of the image, so the score is resolution-free.
+    """
+    ch = np.asarray(channel, dtype=float)
+    n_px = ch.size
+    if ch.max() <= ch.min():
+        return 0.0
+
+    sm = gaussian(ch, sigma=1.0, preserve_range=True)
+    try:
+        t = threshold_otsu(sm)
+    except Exception:
+        t = sm.mean()
+    binary = ndi.binary_fill_holes(sm > t)
+
+    min_area = max(30, int(0.0002 * n_px))
+    binary = remove_small_objects(binary, min_size=min_area)
+
+    lab = sk_label(binary)
+    props = regionprops(lab)
+    if not props:
+        return 0.0
+
+    areas = np.array([p.area for p in props], dtype=float)
+    solid = np.array([p.solidity for p in props], dtype=float)
+    ecc = np.array([p.eccentricity for p in props], dtype=float)
+    extent = np.array([p.extent for p in props], dtype=float)
+
+    w = areas / areas.sum()
+    a_solidity = float(np.sum(w * solid))
+    a_extent = float(np.sum(w * extent))
+    a_roundness = float(np.sum(w * (1.0 - ecc)))
+
+    med_frac = float(np.median(areas) / n_px)
+    lo, hi = 0.0002, 0.03
+    if med_frac < lo:
+        size_term = med_frac / lo
+    elif med_frac > hi:
+        size_term = max(0.0, 1.0 - (med_frac - hi) / (0.20 - hi))
+    else:
+        size_term = 1.0
+
+    cv = areas.std() / areas.mean() if areas.mean() > 0 else 10.0
+    uniformity = 1.0 / (1.0 + cv)
+
+    return float(
+        a_solidity
+        * (0.4 + 0.6 * a_extent)
+        * (0.5 + 0.5 * a_roundness)
+        * (0.2 + 0.8 * size_term)
+        * (0.5 + 0.5 * uniformity)
+    )
+
+
+def detect_nucleus_channel(frames):
+    """Return (nucleus_index, scores) for a list of 2D channel arrays."""
+    scores = [nucleus_likeness(f) for f in frames]
+    return int(np.argmax(scores)), scores
+
+
+def reorder_for_nucleus(frames, nucleus_idx, target_idx=NUCLEUS_TARGET_INDEX):
+    """Return (reordered_frames, order) with the nucleus channel moved to
+    target_idx while the other channels keep their original relative order."""
+    n = len(frames)
+    target_idx = max(0, min(target_idx, n - 1))
+    others = [i for i in range(n) if i != nucleus_idx]  # ascending
+    order = others[:]
+    order.insert(target_idx, nucleus_idx)
+    return [frames[i] for i in order], order
 
 
 def _sanitize_name(name):
@@ -47,6 +204,19 @@ def convert_lif_to_tif():
             n_series = len(images)
             file_stem = os.path.splitext(filename)[0]
             used_names = set()  # guard against duplicate/blank series names
+            channel_map_rows = []  # audit log: which channel became the nucleus
+
+            # Per-series channel LUT names (nucleus = the "Blue" channel).
+            # Aligned with get_iter_image order; [] if metadata is unreadable.
+            luts_per_series = series_channel_luts(new_file) if USE_LUT_METADATA else []
+            if luts_per_series and len(luts_per_series) != n_series:
+                # Alignment isn't guaranteed for exotic files; be safe and drop
+                # to morphology rather than mislabel channels.
+                print(
+                    f"  [{filename}] LUT/series count mismatch "
+                    f"({len(luts_per_series)} vs {n_series}); using morphology."
+                )
+                luts_per_series = []
 
             for series_idx, image in enumerate(images):
                 status_var.set(
@@ -61,7 +231,56 @@ def convert_lif_to_tif():
                     np.array(image.get_frame(z=0, t=0, c=c))
                     for c in range(image.channels)
                 ]
+
+                # --- Normalise the nucleus channel to a fixed position ---
+                # Nucleus is sometimes channel 1, sometimes channel 2. Decide
+                # which channel is the nucleus (manual override > LUT metadata >
+                # morphology) and reorder so it always lands at
+                # NUCLEUS_TARGET_INDEX (channel 2), keeping the other channels
+                # in their original relative order.
+                order = list(range(len(frames)))
+                nuc_idx = None
+                scores = []
+                method = "none"
+                luts = luts_per_series[series_idx] if series_idx < len(luts_per_series) else []
+                if len(frames) >= 2:
+                    if MANUAL_NUCLEUS_CHANNEL is not None and \
+                            MANUAL_NUCLEUS_CHANNEL < len(frames):
+                        nuc_idx = MANUAL_NUCLEUS_CHANNEL
+                        method = "manual"
+                    else:
+                        nuc_idx = nucleus_index_from_lut(luts)
+                        if nuc_idx is not None:
+                            method = "lut"
+                        else:
+                            nuc_idx, scores = detect_nucleus_channel(frames)
+                            method = "morphology"
+                    frames, order = reorder_for_nucleus(frames, nuc_idx)
+
                 matrix_data = np.array(frames)
+
+                # Record the mapping for auditing (original -> new positions)
+                channel_map_rows.append({
+                    "series_index": series_idx + 1,
+                    "series_name": getattr(image, "name", ""),
+                    "n_channels": len(order),
+                    "channel_luts": ";".join(luts) if luts else "",
+                    "detection_method": method,
+                    "detected_nucleus_original_ch": (
+                        (nuc_idx + 1) if nuc_idx is not None else ""
+                    ),
+                    "nucleus_scores": (
+                        ";".join(f"{s:.4f}" for s in scores) if scores else ""
+                    ),
+                    "new_channel_order_1based": ";".join(str(o + 1) for o in order),
+                })
+                print(
+                    f"  [{filename} series {series_idx + 1}] "
+                    f"nucleus=ch{(nuc_idx + 1) if nuc_idx is not None else '?'} "
+                    f"via {method} luts={luts} "
+                    f"scores={[round(s, 4) for s in scores]} "
+                    f"order(1-based)={[o + 1 for o in order]}"
+                )
 
                 # Build a unique, filename-safe suffix from the series name
                 # (falling back to the index) so series never overwrite each
@@ -91,6 +310,14 @@ def convert_lif_to_tif():
                     metadata={"axes": "CYX"},
                 )
                 total_converted += 1
+
+            # Write an audit log so you can verify which physical channel was
+            # treated as the nucleus for every series in this .lif file.
+            if channel_map_rows:
+                map_path = os.path.join(
+                    os.path.dirname(filepath), f"{file_stem}_channel_map.csv"
+                )
+                pd.DataFrame(channel_map_rows).to_csv(map_path, index=False)
         except Exception as e:
             print(f"Error converting {filename}: {e}")
 
