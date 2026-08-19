@@ -12,35 +12,93 @@ from skimage.segmentation import watershed
 from skimage.filters import gaussian, threshold_otsu
 from skimage.exposure import equalize_adapthist
 import pandas as pd
+import re
 from readlif.reader import LifFile
+
+
+def _sanitize_name(name):
+    """Make a LIF series name safe to use inside a filename.
+
+    Series names can contain path separators (e.g. "TileScan 1/Position 3")
+    or other characters that are illegal/awkward in filenames, so collapse
+    anything that isn't a word char, dash or dot into a single underscore.
+    """
+    if name is None:
+        return ""
+    safe = re.sub(r"[^\w\-.]+", "_", str(name)).strip("_")
+    return safe
+
 
 def convert_lif_to_tif():
     file_paths = filedialog.askopenfilenames(filetypes=[("LIF files", "*.lif")])
     if not file_paths:
         return
-    
+
+    total_converted = 0
     for filepath in file_paths:
+        filename = os.path.basename(filepath)
         try:
-            filename = os.path.basename(filepath)
-            status_var.set(f"Converting: {filename}...")
-            root.update() # 即時更新 GUI
-
-
             new_file = LifFile(filepath)
-            image = new_file.get_image(0)
-            
-            frames = [np.array(image.get_frame(z=0, t=0, c=c)) for c in range(image.channels)]
-            matrix_data = np.array(frames)
-            
-            tif_file_name = os.path.splitext(filename)[0] + ".tif"
-            output_tif_path = os.path.join(os.path.dirname(filepath), tif_file_name)
-            
-            tiff.imwrite(output_tif_path, matrix_data, imagej=True, metadata={'axes': 'CYX'})
+
+            # A single .lif file usually holds MANY series (images). The old
+            # code only ever read get_image(0), so every series after the
+            # first was silently dropped. Iterate over every series instead.
+            images = list(new_file.get_iter_image())
+            n_series = len(images)
+            file_stem = os.path.splitext(filename)[0]
+            used_names = set()  # guard against duplicate/blank series names
+
+            for series_idx, image in enumerate(images):
+                status_var.set(
+                    f"Converting: {filename} [series {series_idx + 1}/{n_series}]..."
+                )
+                root.update()  # 即時更新 GUI
+
+                # Each series is a separate image; take the first z / first t
+                # plane for every channel (same behaviour as before, now per
+                # series). z-stacks / time series are collapsed to z=0, t=0.
+                frames = [
+                    np.array(image.get_frame(z=0, t=0, c=c))
+                    for c in range(image.channels)
+                ]
+                matrix_data = np.array(frames)
+
+                # Build a unique, filename-safe suffix from the series name
+                # (falling back to the index) so series never overwrite each
+                # other.
+                safe_series = _sanitize_name(getattr(image, "name", ""))
+                if not safe_series:
+                    safe_series = f"series{series_idx + 1:02d}"
+
+                candidate = f"{file_stem}_{series_idx + 1:02d}_{safe_series}"
+                # Ensure uniqueness even if two series share a name
+                unique = candidate
+                dup = 2
+                while unique in used_names:
+                    unique = f"{candidate}_{dup}"
+                    dup += 1
+                used_names.add(unique)
+
+                tif_file_name = unique + ".tif"
+                output_tif_path = os.path.join(
+                    os.path.dirname(filepath), tif_file_name
+                )
+
+                tiff.imwrite(
+                    output_tif_path,
+                    matrix_data,
+                    imagej=True,
+                    metadata={"axes": "CYX"},
+                )
+                total_converted += 1
         except Exception as e:
             print(f"Error converting {filename}: {e}")
-            
+
     status_var.set("Ready")
-    messagebox.showinfo("Complete", "LIF to TIF conversion finished!")
+    messagebox.showinfo(
+        "Complete",
+        f"LIF to TIF conversion finished!\n{total_converted} series exported.",
+    )
 
 
 
