@@ -9,7 +9,7 @@ from scipy.stats import pearsonr
 from scipy.ndimage import center_of_mass
 from skimage.feature import peak_local_max
 from skimage.segmentation import watershed
-from skimage.filters import gaussian, threshold_otsu
+from skimage.filters import gaussian, threshold_otsu, threshold_li
 from skimage.exposure import equalize_adapthist
 from skimage.measure import label as sk_label, regionprops
 from skimage.morphology import remove_small_objects
@@ -54,6 +54,65 @@ NUCLEUS_LUT_NAME = "Blue"
 # Final index the nucleus should occupy in every exported TIF (0-based).
 # 1 == "channel 2", which is what process_images() expects.
 NUCLEUS_TARGET_INDEX = 1
+
+
+# ---------------------------------------------------------------------------
+# Cell segmentation method
+# ---------------------------------------------------------------------------
+# How the cell footprint (mask) and the watershed elevation are built.
+#   "global"       - ORIGINAL behaviour: heavily-smoothed combined signal,
+#                    mask = smoothed > mean*0.5, watershed on -smoothed. Simple,
+#                    but heavy blur erases the thin dark grooves between cells,
+#                    so boundaries can cut into cells.
+#   "black_groove" - Find cell boundaries at the TRUE BLACK grooves between
+#                    cells. The real inter-cell gaps are near-zero intensity,
+#                    while cell interiors are "at least grey". So: lightly
+#                    smooth the raw signal, threshold for black, fill interior
+#                    holes (grey texture inside a cell is enclosed -> filled;
+#                    real grooves connect to background -> kept as separators),
+#                    then run the nucleus-seeded watershed on the LIGHT signal
+#                    so boundaries snap onto the black grooves instead of the
+#                    blurred midline.
+SEGMENTATION_METHOD = "black_groove"   # "black_groove" | "global"
+
+# --- black_groove parameters (tunable) ---
+# Light smoothing applied to the raw signal before finding grooves. Too small
+# = noisy grooves; too large = grooves blur away. 2-4 is a good range.
+GROOVE_SMOOTH_SIGMA = 2.0
+# How the "black" threshold is chosen:
+#   "fixed" - use BLACK_THRESH_FIXED (absolute intensity). RECOMMENDED here:
+#             "black" is an ABSOLUTE property (near-zero), and a fixed low cut
+#             is both simpler and more correct than a relative one. On these
+#             8-bit images ~3 cleanly separates the black grooves from grey
+#             cell interiors and gives boundaries that hug the real cells.
+#   "li"    - data-driven (skimage threshold_li). WARNING: when the image is
+#             mostly black background, Li is pulled up (e.g. ~5-10) and starts
+#             classifying grey cell interior as "black", eating the foreground.
+#             It is clamped below (see estimate_black_threshold) but "fixed" is
+#             preferred for this data.
+BLACK_THRESH_METHOD = "fixed"
+BLACK_THRESH_FIXED = 3.0
+# Cap on how far a cell can extend from its nucleus (px), (small, large).
+GROOVE_TERRITORY_DILATE = (35, 70)
+# Guaranteed body around every nucleus so very dim cells aren't lost (px),
+# (small, large). Must be < the territory cap above.
+GROOVE_NUCLEUS_FLOOR = (16, 32)
+
+
+def estimate_black_threshold(sig):
+    """Pick the intensity below which a pixel counts as 'black' (groove /
+    background). Data-driven by default, but clamped to stay a genuinely LOW
+    (black) cut rather than drifting up into grey cell interior."""
+    if BLACK_THRESH_METHOD == "fixed":
+        return float(BLACK_THRESH_FIXED)
+    try:
+        t = float(threshold_li(sig))
+    except Exception:
+        t = float(np.percentile(sig, 60))
+    # Keep it a genuinely LOW (black) cut. Li drifts up on mostly-black images
+    # and would eat grey cell interior, so cap it at the 60th percentile.
+    hi = float(max(2.0, np.percentile(sig, 60)))
+    return float(min(max(t, 1.0), hi))
 
 
 def series_channel_luts(lif_file):
@@ -388,6 +447,26 @@ def local_contrast_enhance(channel, target_mask=None, clip_limit=0.03):
         enhanced = np.where(target_mask, enhanced, channel)
     return enhanced
 
+
+def new_image_sized_fig(height, width, dpi=100):
+    """Create a matplotlib (fig, ax) whose saved output will be EXACTLY
+    width x height pixels. The Axes fills the whole canvas with no padding;
+    pair with save_image_sized_fig (and do NOT use bbox_inches='tight')."""
+    fig = plt.figure(figsize=(width / dpi, height / dpi), dpi=dpi)
+    ax = fig.add_axes([0.0, 0.0, 1.0, 1.0])
+    ax.set_axis_off()
+    return fig, ax, dpi
+
+
+def save_image_sized_fig(fig, ax, height, width, path, dpi):
+    """Pin the axes to the exact image extent (origin top-left) and save so
+    the PNG is exactly width x height pixels."""
+    ax.set_xlim(-0.5, width - 0.5)
+    ax.set_ylim(height - 0.5, -0.5)
+    fig.savefig(path, dpi=dpi)
+    plt.close(fig)
+
+
 def process_images():
     file_paths = filedialog.askopenfilenames(filetypes=[("TIFF files", "*.tif *.tiff")])
     if not file_paths:
@@ -406,8 +485,18 @@ def process_images():
             
             # Original channels: used for quantification (Pearson / M1 / M2)
             ch1, ch2, ch3 = raw_data[0], raw_data[1], raw_data[2]
-            print(ch1.shape[1])
-            Small_pic = (ch1.shape[1] < 1000)
+
+            # --- Detect THIS tiff's own size, up front ---
+            # Series within a single .lif can have DIFFERENT sizes (e.g. some
+            # 512x512, some 1024x1024). So the size is checked per-file here,
+            # and every size-dependent value below (nucleus noise area, min
+            # nucleus area, min cell area, and the output PNG dimensions) is
+            # derived from this - never assumed uniform across files. Using
+            # max(H, W) makes it robust to non-square images too.
+            img_h, img_w = ch1.shape[:2]
+            Small_pic = (max(img_h, img_w) < 1000)
+            print(f"{filename}: size = {img_w}x{img_h} -> "
+                  f"{'small (512-class)' if Small_pic else 'large (1024-class)'}")
             # Stretched channels (0-255): used only for segmentation, so that
             # lower-expression cells are not lost during thresholding/watershed
             stretched_ch1 = stretch_to_255(ch1)
@@ -422,6 +511,32 @@ def process_images():
             # nuclei - this stops dim nuclei from being washed out when
             # combined with the other channels below.
             binary_ch2 = binarize_channel(stretched_ch2, fill_holes=True)
+
+            # --- Remove extremely small noise specks from the nucleus mask ---
+            # BEFORE any labeling/segmentation, drop tiny bright specks in the
+            # nucleus channel. If left in, they would (a) become spurious
+            # connected components = false nuclei / watershed seeds, and (b)
+            # distort the nucleus-size judgement. This runs on the binary mask
+            # at the source, so every downstream use (target/region masks, the
+            # smoothed segmentation intensity, and the erosion + labeling step)
+            # sees the cleaned nucleus. The cutoff is well below MIN_NUCLEUS_AREA
+            # so real (even small) nuclei are kept - only "極度細小" noise goes.
+            NUCLEUS_NOISE_AREA = 60 if Small_pic else 120  # px; tune if needed
+            n_before = ndi.label(binary_ch2 > 0)[1]
+            cleaned_nucleus_bool = remove_small_objects(
+                binary_ch2 > 0, min_size=NUCLEUS_NOISE_AREA
+            )
+            n_after = ndi.label(cleaned_nucleus_bool)[1]
+            print(f"Nucleus noise removal: {n_before} -> {n_after} components "
+                  f"(dropped {n_before - n_after} specks < {NUCLEUS_NOISE_AREA}px)")
+            binary_ch2 = cleaned_nucleus_bool.astype(float) * 255.0
+
+            # Save the cleaned nucleus mask so the denoising can be checked
+            tiff.imwrite(
+                f"{os.path.splitext(filepath)[0]}_nucleus_binary.tif",
+                (binary_ch2.astype(np.uint8)),
+            )
+
             target_mask = binary_ch2 > 0
             region_mask = (stretched_ch1 + binary_ch2 + stretched_ch3) > 0
 
@@ -446,8 +561,37 @@ def process_images():
             data = (smoothed_data1 + smoothed_data2+ smoothed_data3) / 3
             smoothed_data = gaussian(data, sigma=10.0)
 
-            threshold = np.mean(smoothed_data) * 0.5
-            mask = smoothed_data > threshold
+            # --- Build the cell footprint (mask) and the watershed elevation
+            #     (seg_surface) according to SEGMENTATION_METHOD. ---
+            if SEGMENTATION_METHOD == "black_groove":
+                # Lightly-smoothed RAW signal (not CLAHE-enhanced, so black
+                # stays black). Cytoplasm markers define the cell body.
+                sig = gaussian((stretched_ch1 + stretched_ch3) / 2.0,
+                               sigma=GROOVE_SMOOTH_SIGMA, preserve_range=True)
+                T = estimate_black_threshold(sig)
+                # Cell foreground = not-black; fill enclosed interior texture
+                # (grey specks inside a cell) but keep grooves (which connect to
+                # background and so are not enclosed).
+                fg = ndi.binary_fill_holes(sig >= T)
+                fg = remove_small_objects(fg, min_size=(200 if Small_pic else 800))
+                D = GROOVE_TERRITORY_DILATE[0 if Small_pic else 1]
+                floor = GROOVE_NUCLEUS_FLOOR[0 if Small_pic else 1]
+                nuc_bool = binary_ch2 > 0
+                territory = ndi.binary_dilation(nuc_bool, iterations=D)
+                nucleus_floor = ndi.binary_dilation(nuc_bool, iterations=floor)
+                # Cap each cell to its nucleus territory ∩ real signal, but
+                # guarantee at least a floor body around every nucleus so very
+                # dim cells are not lost.
+                mask = (territory & fg) | nucleus_floor
+                # Watershed on the LIGHT signal so boundaries snap to the black
+                # grooves (darkest = highest ridge) instead of a blurred midline.
+                seg_surface = -sig
+                print(f"Segmentation: black_groove (black<{T:.2f})")
+            else:  # "global" - original behaviour
+                threshold = np.mean(smoothed_data) * 0.5
+                mask = smoothed_data > threshold
+                seg_surface = -smoothed_data
+                print("Segmentation: global")
 
             # Save mask as a TIF for visual verification
             tiff.imwrite(f"{base_name}_mask.tif", (mask.astype(np.uint8) * 255))
@@ -506,17 +650,29 @@ def process_images():
             if nucleus_coords.size > 0:
                 pd.DataFrame(nucleus_coords, columns=['row', 'col']).to_csv(f"{base_name}_nucleus_coordinates.csv", index=False)
 
-            # Save an overlay image showing the mask with nucleus seed centers marked
-            plt.figure(figsize=(10, 8))
-            plt.imshow(mask, cmap='gray')
+            # Save an overlay image showing the mask with nucleus seed centers
+            # marked, at EXACTLY the original image size (512 or 1024).
+            # Show ALL detected nuclei BEFORE the size filter so the effect of
+            # MIN_NUCLEUS_AREA is visible: red X = kept (used as watershed
+            # seeds); cyan O = dropped because area < MIN_NUCLEUS_AREA. The
+            # actual seed selection is unchanged - this only adds the dropped
+            # ones to the picture for inspection.
+            mh, mw = mask.shape[:2]
+            fig, ax, _dpi = new_image_sized_fig(mh, mw)
+            ax.imshow(mask, cmap='gray')
+            dropped_small = np.array([[n['row'], n['col']] for n in all_nuclei
+                                      if n['area'] < MIN_NUCLEUS_AREA])
+            if dropped_small.size > 0:
+                ax.scatter(dropped_small[:, 1], dropped_small[:, 0],
+                           facecolors='none', edgecolors='cyan',
+                           s=(30 if Small_pic else 55), marker='o', linewidths=1.2)
             if nucleus_coords.size > 0:
-                plt.scatter(nucleus_coords[:, 1], nucleus_coords[:, 0], c='red', s=20, marker='x')
-            plt.axis('off')
-            plt.tight_layout()
-            plt.savefig(f"{base_name}_mask_nuclei.png", dpi=300, bbox_inches='tight')
-            plt.close()
+                ax.scatter(nucleus_coords[:, 1], nucleus_coords[:, 0],
+                           c='red', s=(20 if Small_pic else 40), marker='x')
+            save_image_sized_fig(fig, ax, mh, mw,
+                                 f"{base_name}_mask_nuclei.png", _dpi)
 
-            labels = watershed(-smoothed_data, markers, mask=mask)
+            labels = watershed(seg_surface, markers, mask=mask)
 
             image_height, image_width = data.shape
             unique_labels = np.unique(labels)[1:] 
@@ -526,6 +682,7 @@ def process_images():
                 MIN_CELL_AREA = 8000  # minimum region area (px) to count as a cell
 
             filtered_original_labels = []
+            cell_area_by_label = {}  # label -> cell (watershed region) area in px
             for label_val in unique_labels:
                 coords = np.argwhere(labels == label_val)
                 is_edge = any(r == 0 or r == image_height - 1 or c == 0 or c == image_width - 1 for r, c in coords)
@@ -537,6 +694,7 @@ def process_images():
                     continue
 
                 filtered_original_labels.append(label_val)
+                cell_area_by_label[label_val] = area
 
             # --- Nucleus-size eligibility filter for correlation ---
             # Each surviving cell (label_val) was seeded by exactly one
@@ -549,20 +707,86 @@ def process_images():
             NUCLEUS_AREA_MIN_RATIO = 0.7
             NUCLEUS_AREA_MAX_RATIO = 1.9
 
+            # --- Cell-to-nucleus area ratio filter (tunable) ---
+            # A real, well-segmented cell should be noticeably larger than its
+            # own nucleus. If cell_area / nucleus_area is too small, the
+            # "cell" is basically just the nucleus with little cytoplasm -
+            # usually a mis-segmentation or a cell with no real signal area -
+            # so it's excluded from the correlation analysis. Raise/lower this
+            # to be stricter/looser.
+            MIN_CELL_TO_NUCLEUS_RATIO = 2.0
+
             cell_nucleus_area = {lv: nucleus_area_by_label.get(lv, np.nan) for lv in filtered_original_labels}
             valid_nucleus_areas = [a for a in cell_nucleus_area.values() if not np.isnan(a)]
             median_cell_nucleus_area = float(np.median(valid_nucleus_areas)) if valid_nucleus_areas else 0.0
             low_nucleus_cutoff = median_cell_nucleus_area * NUCLEUS_AREA_MIN_RATIO
             high_nucleus_cutoff = median_cell_nucleus_area * NUCLEUS_AREA_MAX_RATIO
 
+            def _cell_nucleus_ratio(lv):
+                n_area = cell_nucleus_area.get(lv, np.nan)
+                c_area = cell_area_by_label.get(lv, np.nan)
+                if np.isnan(n_area) or np.isnan(c_area) or n_area <= 0:
+                    return np.nan
+                return c_area / n_area
+
+            # --- Cell/nucleus ratio upper-outlier filter (mean + N*SD) ---
+            # On top of the fixed lower bound above, drop cells whose ratio is
+            # abnormally HIGH relative to the rest of this image: an unusually
+            # large cell-to-nucleus ratio usually means a mis-segmentation
+            # (merged cells / territory over-grew / an abnormally tiny nucleus).
+            # The cutoff is mean + RATIO_OUTLIER_SD * SD of the ratio across all
+            # cells in this image. Raise RATIO_OUTLIER_SD to be more lenient.
+            RATIO_OUTLIER_SD = 2.0
+            _ratios_all = [_cell_nucleus_ratio(lv) for lv in filtered_original_labels]
+            _ratios_all = [r for r in _ratios_all if not np.isnan(r)]
+            if len(_ratios_all) >= 2:
+                ratio_mean = float(np.mean(_ratios_all))
+                ratio_sd = float(np.std(_ratios_all))
+                high_ratio_cutoff = ratio_mean + RATIO_OUTLIER_SD * ratio_sd
+            else:
+                high_ratio_cutoff = np.inf  # not enough cells to define outliers
+            print(f"Cell/nucleus ratio: mean={np.mean(_ratios_all):.2f} "
+                  f"SD={np.std(_ratios_all):.2f} -> drop ratio > "
+                  f"{high_ratio_cutoff:.2f}" if _ratios_all else
+                  "Cell/nucleus ratio: no valid cells")
+
+            # --- Multi-nucleus filter ---
+            # Count how many nuclei fall inside each cell, using the nucleus set
+            # AFTER noise removal but BEFORE the MIN_NUCLEUS_AREA size filter
+            # (i.e. all_nuclei - includes the small ones that don't become
+            # seeds). A cell that contains more than MAX_NUCLEI_PER_CELL nuclei
+            # is likely binucleate/multinucleate or two cells merged into one
+            # region, so it is excluded from the analysis. Note each cell always
+            # contains at least its own seed nucleus, so count>=1 is normal.
+            MAX_NUCLEI_PER_CELL = 1
+            nuclei_in_cell = {lv: 0 for lv in filtered_original_labels}
+            for nuc in all_nuclei:
+                r = int(round(nuc['row'])); c = int(round(nuc['col']))
+                if 0 <= r < image_height and 0 <= c < image_width:
+                    lv = int(labels[r, c])
+                    if lv in nuclei_in_cell:
+                        nuclei_in_cell[lv] += 1
+            n_multi = sum(1 for lv in filtered_original_labels
+                          if nuclei_in_cell[lv] > MAX_NUCLEI_PER_CELL)
+            print(f"Multi-nucleus filter: {n_multi} cell(s) with "
+                  f">{MAX_NUCLEI_PER_CELL} nucleus excluded")
+
             eligible_labels = []
             ineligible_labels = []
             for label_val in filtered_original_labels:
                 area = cell_nucleus_area[label_val]
+                ratio = _cell_nucleus_ratio(label_val)
                 is_eligible = (
                     median_cell_nucleus_area > 0
                     and not np.isnan(area)
                     and low_nucleus_cutoff <= area <= high_nucleus_cutoff
+                    # cell must be sufficiently larger than its nucleus
+                    and not np.isnan(ratio)
+                    and ratio >= MIN_CELL_TO_NUCLEUS_RATIO
+                    # drop upper outliers (ratio > mean + N*SD)
+                    and ratio <= high_ratio_cutoff
+                    # NEW: exclude cells containing more than one nucleus
+                    and nuclei_in_cell[label_val] <= MAX_NUCLEI_PER_CELL
                 )
                 (eligible_labels if is_eligible else ineligible_labels).append(label_val)
 
@@ -582,7 +806,10 @@ def process_images():
 
                     correlation_results.append({
                         'Region Label': label_val,
+                        'Cell Area': cell_area_by_label[label_val],
                         'Nucleus Area': cell_nucleus_area[label_val],
+                        'Nuclei In Cell': nuclei_in_cell[label_val],
+                        'Cell/Nucleus Ratio': _cell_nucleus_ratio(label_val),
                         'Pearson Correlation': corr,
                         'P-value': p_val,
                         'M1 Coefficient': m1,
@@ -596,20 +823,27 @@ def process_images():
             for label_val in filtered_original_labels:
                 filtered_img[labels == label_val] = label_val
 
-            plt.figure(figsize=(10, 8))
-            plt.imshow(filtered_img, cmap='nipy_spectral')
+            # Save the labeled image at EXACTLY the original image resolution
+            # (e.g. 512x512 or 1024x1024). image_height/image_width come from
+            # data.shape, i.e. this file's own pixel size.
+            fig, ax, _dpi = new_image_sized_fig(image_height, image_width)
+            ax.imshow(filtered_img, cmap='nipy_spectral')
 
+            # Scale label text / marker size with the image so the overlay is
+            # readable at both 512 and 1024 (uses the Small_pic flag you set).
+            _fs = 8 if Small_pic else 14
+            _ms = 250 if Small_pic else 700
             for label_val in filtered_original_labels:
                 cy, cx = center_of_mass(data, labels, label_val)
-                plt.text(cx, cy, str(int(label_val)), color='white', fontsize=8, ha='center', va='center')
+                ax.text(cx, cy, str(int(label_val)), color='white',
+                        fontsize=_fs, ha='center', va='center')
                 if label_val in ineligible_labels:
-                    # Mark cells excluded from correlation (abnormal nucleus size) with a red X
-                    plt.scatter(cx, cy, s=250, facecolors='none', edgecolors='red', marker='o', linewidths=2)
+                    # Mark cells excluded from correlation (abnormal nucleus size)
+                    ax.scatter(cx, cy, s=_ms, facecolors='none',
+                               edgecolors='red', marker='o', linewidths=2)
 
-            plt.axis('off')
-            plt.tight_layout()
-            plt.savefig(f"{base_name}.png", dpi=300, bbox_inches='tight')
-            plt.close()
+            save_image_sized_fig(fig, ax, image_height, image_width,
+                                 f"{base_name}.png", _dpi)
 
         except Exception as e:
             print(f"Error processing {filename}: {e}")
